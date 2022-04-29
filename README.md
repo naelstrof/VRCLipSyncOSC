@@ -37,24 +37,23 @@ TongueY
 
 Teeth/Lips blend:
 
-![Lips blend](LipsBlend.webm)
+https://user-images.githubusercontent.com/1131571/166071983-ea8a2420-80d1-4c8f-b679-37e6aa63a3a5.mp4
 
 Smile blend:
 
-![Smile blend](SmileBlend.webm)
+https://user-images.githubusercontent.com/1131571/166072027-b1d470ce-fd2b-4a80-b846-a38084b037c1.mp4
 
 Tongue blend
 
-![Tongue blend](TongueBlend.webm)
+https://user-images.githubusercontent.com/1131571/166072048-e6479a43-01bd-4fbc-9bcd-c58038f36ef3.mp4
 
 Jaw blend
 
-![Jaw blend](JawBlend.webm)
+https://user-images.githubusercontent.com/1131571/166072089-06c102c5-bb01-443c-8eff-005cef595715.mp4
 
 Pout blend
 
-![Pout blend](PoutBlend.webm)
-
+https://user-images.githubusercontent.com/1131571/166072109-9fd08604-ed50-4d41-99f1-88a9887012a5.mp4
 
 With the blends set up, now we need to tackle one last problem. OSC parameters only update about 4 times a second for other players, to prevent it from being choppy we can use [hai's implementation](https://hai-vr.notion.site/Avatars-3-0-Animated-Animator-Parameters-and-Smoothing-f128c71dd3184c2bb61a4cff8296ada5#aeb2d0d54edf41e1a846818657dfc1b7) of Animator smoothing to have it appear smooth for other players.
 
@@ -125,5 +124,6 @@ Tongue_DownRight_Morph
 You can find out what the keys represent by checking out HTC Vive's official documentation here: https://developer-express.vive.com/resources/vive-sense/eye-and-facial-tracking-sdk/documentation/
 
 2. config.lua must have an update function that takes the lipdata table, this is ran every update in order to send data to VRChat.
-3. Make sure to call `SendData("/avatar/parameters/myparameter", value)` before the end of `update` in order to send the parameters to VRChat. The values are cached and sent at the end.
-4. If there's an error in `config.lua`, the executable will report the error and immediately close. A convenience bat file has been included so that the error message can be read. Use it if the executable flashes or blinks when you run it.
+3. All parameters should be normalized (0 to 1), otherwise the animation smoother trick won't work correctly.
+4. Make sure to call `SendData("/avatar/parameters/myparameter", value)` before the end of `update` in order to send the parameters to VRChat. The values are cached and sent at the end.
+5. If there's an error in `config.lua`, the executable will report the error and immediately close. A convenience bat file has been included so that the error message can be read. Use it if the executable flashes or blinks when you run it.
