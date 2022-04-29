@@ -30,6 +30,7 @@ MouthX
 Tongue
 TongueX
 TongueY
+Pout
 ```
 ![Avatar parameter image](AvatarParameters.png)
 
