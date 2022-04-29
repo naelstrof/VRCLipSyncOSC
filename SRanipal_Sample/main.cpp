@@ -14,41 +14,78 @@
 #include <map>
 
 #include <winsock2.h>
+// For ipv6 support
+#include <Ws2tcpip.h>
+#include <tchar.h>
 
 #pragma comment (lib, "SRanipal.lib")
-using namespace ViveSR;
+#pragma comment (lib, "Ws2_32.lib")
 
-#define EnableEyeTracking 0
-#define DisableEyeTracking 1
+using namespace ViveSR;
 
 std::string ConvertLipCode(ViveSR::anipal::Lip::Version2::LipShape_v2 lipCode);
 std::string CovertErrorCode(int error);
+void main_loop(ViveSR::anipal::Lip::LipData_v2& lip_data_v2, lua_State* lua_state, SOCKET ConnectSocket);
 
+// Stuff I'd rather keep on the heap instead of the stack.
+char networkBuffer[1024];
+char lip_image[800 * 400];
+// Things shared between functions.
 std::map<const char*, float> VRCData;
+volatile bool running = true;
+
+// We hook this into lua so the user can call it from config.lua. We specifically just store it so we can send a meaningul OSC packet later with SendData()
 static int SetVRCData(lua_State* lua_state) {
     const char* name = lua_tostring(lua_state, -2);
-    float num = lua_tonumber(lua_state, -1);
+    float num = (float)lua_tonumber(lua_state, -1);
     VRCData[name] = num;
     return 0;
 }
-char networkBuffer[1024];
-void SendData(std::map<const char*, float> data, SOCKET socket) {
+
+// This function sends everything in the dictonary out to VRChat, then clears the dictionary.
+// FIXME: it has a limit of 1024 bytes so that it doesn't have to fiddle with memory allocs. This is probably fine but it should probably double in size automatically if it hits the limit.
+void SendData(std::map<const char*, float>& data, SOCKET socket) {
+    // Nothing to send? quit out
+    if (data.size() == 0) {
+        return;
+    }
     OSCPP::Client::Packet packet(networkBuffer, 1024);
+    // FIXME: Using a fake timestamp 1234, I believe this is ignored by VRChat, though it would normally be used to sort the incoming packets.
+    // If this app ever implements a delta time we could use the high resolution timer to send some good microsecond timestamps instead.
     packet.openBundle(1234ULL);
+    // Foreach element in the dictionary, construct a message.
     for (const auto& kv : data) {
         packet.openMessage(kv.first, 1).float32(kv.second).closeMessage();
     }
     packet.closeBundle();
-    int result = send(socket, networkBuffer, packet.size(), 0);
+    // Send it!
+    int result = send(socket, networkBuffer, (int)packet.size(), 0);
     if (result == SOCKET_ERROR) {
         std::cerr << "Failed to send packet to VRChat with error code " << WSAGetLastError() << "\n" << std::flush;
-        throw "Aborting...\n";
+        throw std::exception("Aborting...");
     }
+    data.clear();
 }
-char lip_image[800 * 400];
-bool running = true;
+// We catch specifically SIGINT (ctrl+c), so we can clean up and properly relinquish control of the lipsync api.
+void signal_calllback_handler(int signum) {
+    std::cerr << "Caught signal " << signum << ", cleanly shutting down...\n" << std::flush;
+    running = false;
+}
+// Windows version of SIGINT, apparently :vomit:
+BOOL WINAPI consoleHandler(_In_ DWORD signal) {
+    // Pass signal to another signal handler
+    if (signal != CTRL_C_EVENT) {
+        return FALSE;
+    }
+    std::cerr << "Caught signal " << signal << ", cleanly shutting down...\n" << std::flush;
+    running = false;
+    return TRUE;
+}
+
+// Main's responsibility right now is to initialize/uninitialize our three apis: An outgoing UDP packet socket, a lua state, and the lipsync api.
 int main(int argc, char** argv) {
-    // connect to vrchat -------------
+    int exitCode = EXIT_SUCCESS;
+    // connect to vrchat, most of this code was appropriated from https://docs.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-send
     int iResult;
     WSADATA wsaData;
     SOCKET ConnectSocket = INVALID_SOCKET;
@@ -71,7 +108,9 @@ int main(int argc, char** argv) {
     // The sockaddr_in structure specifies the address family,
     // IP address, and port of the server to be connected to.
     clientService.sin_family = AF_INET;
-    clientService.sin_addr.s_addr = inet_addr("127.0.0.1");
+    // inet_addr only supports ipv4, I know it's overkill to support ipv6 when I only plan to send to localhost, but that warning message (C4996) kept bothering me.
+    //clientService.sin_addr.s_addr = inet_addr("127.0.0.1");
+    InetPton(AF_INET, _T("127.0.0.1"), &clientService.sin_addr.s_addr);
     clientService.sin_port = htons(9000);
 
     //----------------------
@@ -84,67 +123,108 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // initialize liptracking ---------
-    int error = ViveSR::anipal::Initial(ViveSR::anipal::Lip::ANIPAL_TYPE_LIP_V2, NULL);
-    if (error == ViveSR::Error::WORK) {
-        std::cout << "Successfully initialize version2 Lip engine.\n" << std::flush;
-    } else {
-        std::cout << "Failed to initialize version2 Lip engine. Please refer to the code " << error << " " << CovertErrorCode(error).c_str() << "\n" << std::flush;
-        return 1;
-    }
-
     // create new Lua state -----------
     lua_State* lua_state;
     lua_state = luaL_newstate();
     luaL_openlibs(lua_state);
 
     try {
+        // Give lua our "SendData" command, so the user can call it.
         lua_register(lua_state, "SendData", SetVRCData);
-        // run the Lua script
+        // run the Lua script config.lua.
         if (luaL_dofile(lua_state, "config.lua") != LUA_OK) {
-            throw lua_tostring(lua_state,-1);
+            throw std::exception(lua_tostring(lua_state,-1));
         } else {
             std::cout << "Successfully loaded config.lua.\n" << std::flush;
         }
-
-        ViveSR::anipal::Lip::LipData_v2 lip_data_v2;
-        lip_data_v2.image = lip_image;
-        int result = ViveSR::Error::WORK;
-        while (running) {
-            result = ViveSR::anipal::Lip::GetLipData_v2(&lip_data_v2);
-            if (result == ViveSR::Error::WORK) {
-                float* weightings = lip_data_v2.prediction_data.blend_shape_weight;
-                lua_getglobal(lua_state, "update");
-                if (!lua_isfunction(lua_state, -1)) {
-                    lua_pop(lua_state, 1);
-                    throw "ERROR: update function not found in config.lua\n";
-                }
-                lua_newtable(lua_state);
-                for (int i = ViveSR::anipal::Lip::Version2::Jaw_Right; i < ViveSR::anipal::Lip::Version2::Max; i++) {
-                    lua_pushstring(lua_state, ConvertLipCode((ViveSR::anipal::Lip::Version2::LipShape_v2)i).c_str());
-                    lua_pushnumber(lua_state, weightings[i]);
-                    lua_settable(lua_state, -3);
-                }
-                if (lua_pcall(lua_state, 1, 0, 0) != LUA_OK) {
-                    throw lua_tostring(lua_state,-1);
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            } else {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-            }
-            SendData(VRCData, ConnectSocket);
+        // Quickly check to make sure the update function is available by pushing it on the lua stack
+        lua_getglobal(lua_state, "update");
+        if (!lua_isfunction(lua_state, -1)) {
+            throw std::exception("ERROR: update function not found in config.lua");
         }
+        lua_pop(lua_state, 1);
+        
+        // We initialize liptracking really late, because it's very slow and also usually launches SteamVR.
+        int error = ViveSR::anipal::Initial(ViveSR::anipal::Lip::ANIPAL_TYPE_LIP_V2, NULL);
+        if (error == ViveSR::Error::WORK) {
+            std::cout << "Successfully initialize version2 Lip engine.\n" << std::flush;
+        } else {
+            std::cerr << "Failed to initialize version2 Lip engine. Please refer to the code " << error << " " << CovertErrorCode(error) << "\n" << std::flush;
+            throw std::exception("Aborting...");
+        }
+        
+        ViveSR::anipal::Lip::LipData_v2 lip_data_v2;
+        // we use some data on the heap (lip_image) to store the depth data. This is much faster than using the stack.
+        lip_data_v2.image = lip_image;
+
+        // Right before we start our loop, we finally subscribe to the SIGINT interrupt. This is so we can cleanly shut down if the user hits ctrl+c.
+        typedef void (*SignalHandlerPointer)(int);
+        SignalHandlerPointer previousHandler;
+        previousHandler = signal(SIGINT, signal_calllback_handler);
+        if (previousHandler == SIG_ERR) {
+            throw std::exception("Could not set signal handler!");
+        }
+        if (!SetConsoleCtrlHandler(consoleHandler, TRUE)) {
+            throw std::exception("Could not set control handler!");
+        }
+
+        std::cout << "Running! Hit Ctrl+C to exit.\n" << std::flush;
+        while (running) {
+            main_loop(lip_data_v2, lua_state, ConnectSocket);
+        }
+        // Reset the signal handlers
+        signal(SIGINT, previousHandler);
+        SetConsoleCtrlHandler(consoleHandler, FALSE);
     } catch (std::exception& e) {
+        // Just attempt to cleanly report the error before shutting down.
         std::cerr << e.what() << std::flush;
-    } catch (const char* msg) {
-        std::cerr << msg << std::flush;
+        exitCode = EXIT_FAILURE;
     }
-    // close the Lua state
-    lua_close(lua_state);
-    // release the lip sync tracking.
+    // Release the lip sync tracking.
     ViveSR::anipal::Release(ViveSR::anipal::Lip::ANIPAL_TYPE_LIP_V2);
+    // Close the Lua state
+    lua_close(lua_state);
+    // Close our connection
+    iResult = closesocket(ConnectSocket);
+    if (iResult == SOCKET_ERROR) {
+        std::cerr << "Close socket failed with error: " << WSAGetLastError() << "\n" << std::flush;
+        WSACleanup();
+        return 1;
+    }
+    WSACleanup();
+    return exitCode;
 }
 
+// main_loop is ran very often within a while loop. This is where all our apis are set up, error checked, and available for use.
+void main_loop(ViveSR::anipal::Lip::LipData_v2& lip_data_v2, lua_State* lua_state, SOCKET ConnectSocket) {
+    int result = ViveSR::anipal::Lip::GetLipData_v2(&lip_data_v2);
+    if (result == ViveSR::Error::WORK) {
+        float* weightings = lip_data_v2.prediction_data.blend_shape_weight;
+        // We know the update function exists at this point because it was checked earlier.
+        lua_getglobal(lua_state, "update");
+        // Construct a new table
+        lua_newtable(lua_state);
+        // Loop through all the Version2 enums to store the new data into the table.
+        for (int i = ViveSR::anipal::Lip::Version2::Jaw_Right; i < ViveSR::anipal::Lip::Version2::Max; i++) {
+            lua_pushstring(lua_state, ConvertLipCode((ViveSR::anipal::Lip::Version2::LipShape_v2)i).c_str());
+            lua_pushnumber(lua_state, weightings[i]);
+            lua_settable(lua_state, -3);
+        }
+        // Finally call the function, checking for errors!
+        if (lua_pcall(lua_state, 1, 0, 0) != LUA_OK) {
+            throw std::exception(lua_tostring(lua_state,-1));
+        }
+        // We sleep for 10 milliseconds so that we can relinquish control back to the OS. Without this we'll eat an entire core!
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } else {
+        // If the lipsync failed, we wait for a bit longer (steamvr could be starting, headset could be off, etc).
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    }
+    // Lua should've pushed a bunch of stuff into our dictionary. Here we wrap it all up and send it to VRChat.
+    SendData(VRCData, ConnectSocket);
+}
+
+// In C++, enums are truely just raw bytes. Gotta convert them somehow! :clown:
 std::string ConvertLipCode(ViveSR::anipal::Lip::Version2::LipShape_v2 lipShape) {
     std::string result = "";
     switch (lipShape) {
@@ -187,7 +267,8 @@ std::string ConvertLipCode(ViveSR::anipal::Lip::Version2::LipShape_v2 lipShape) 
         case ViveSR::anipal::Lip::Version2::Tongue_DownLeft_Morph: result = "Tongue_DownLeft_Morph"; break;
         case ViveSR::anipal::Lip::Version2::Tongue_DownRight_Morph: result = "Tongue_DownRight_Morph"; break;
         case ViveSR::anipal::Lip::Version2::Max: result = "Max"; break;
-        default: result = "INVALID"; break;
+        // This should never happen, if it does then there's a critical error that should probably be addressed.
+        default: throw std::exception("Unknown lip shape code"); break;
     }
     return result;
 }
