@@ -25,7 +25,9 @@ using namespace ViveSR;
 
 std::string ConvertLipCode(ViveSR::anipal::Lip::Version2::LipShape_v2 lipCode);
 std::string CovertErrorCode(int error);
-void main_loop(ViveSR::anipal::Lip::LipData_v2& lip_data_v2, lua_State* lua_state, SOCKET ConnectSocket);
+void lua_pushlips(lua_State* lua_state, ViveSR::anipal::Lip::LipData_v2& lip_data_v2);
+void lua_pusheye(lua_State* lua_state, ViveSR::anipal::Eye::SingleEyeData& targetEye, ViveSR::anipal::Eye::SingleEyeExpression& targetExpression);
+void lua_pusheyes(lua_State* lua_state, ViveSR::anipal::Eye::EyeData_v2& eye_data_v2);
 
 // Stuff I'd rather keep on the heap instead of the stack.
 char networkBuffer[1024];
@@ -33,6 +35,8 @@ char lip_image[800 * 400];
 // Things shared between functions.
 std::map<const char*, float> VRCData;
 volatile bool running = true;
+bool workingEyes = false;
+bool workingLips = false;
 
 // We hook this into lua so the user can call it from config.lua. We specifically just store it so we can send a meaningul OSC packet later with SendData()
 static int SetVRCData(lua_State* lua_state) {
@@ -137,7 +141,7 @@ int main(int argc, char** argv) {
         } else {
             std::cout << "Successfully loaded config.lua.\n" << std::flush;
         }
-        // Quickly check to make sure the update function is available by pushing it on the lua stack
+        // Quickly check to make sure the update functions are available by pushing them on the lua stack
         lua_getglobal(lua_state, "update");
         if (!lua_isfunction(lua_state, -1)) {
             throw std::exception("ERROR: update function not found in config.lua");
@@ -148,14 +152,31 @@ int main(int argc, char** argv) {
         int error = ViveSR::anipal::Initial(ViveSR::anipal::Lip::ANIPAL_TYPE_LIP_V2, NULL);
         if (error == ViveSR::Error::WORK) {
             std::cout << "Successfully initialize version2 Lip engine.\n" << std::flush;
+            workingLips = true;
         } else {
-            std::cerr << "Failed to initialize version2 Lip engine. Please refer to the code " << error << " " << CovertErrorCode(error) << "\n" << std::flush;
-            throw std::exception("Aborting...");
+            std::cerr << "[Non-fatal] Failed to initialize version2 Lip engine. Please refer to the code " << error << " " << CovertErrorCode(error) << "\n" << std::flush;
         }
+
+        error = ViveSR::anipal::Initial(ViveSR::anipal::Eye::ANIPAL_TYPE_EYE_V2, NULL);
+        if (error == ViveSR::Error::WORK) {
+            std::cout << "Successfully initialize version2 Eye engine.\n" << std::flush;
+            workingEyes = true;
+        } else {
+            std::cerr << "[Non-fatal] Failed to initialize version2 Eye engine. Please refer to the code " << error << " " << CovertErrorCode(error) << "\n" << std::flush;
+        }
+
+        // No data!
+        if (!workingLips && !workingEyes) {
+            throw std::exception("Aborting due to having no data to send!");
+        }
+
         
         ViveSR::anipal::Lip::LipData_v2 lip_data_v2;
         // we use some data on the heap (lip_image) to store the depth data. This is much faster than using the stack.
         lip_data_v2.image = lip_image;
+
+        // eye data apparently has a different api, and does not need any data.
+        ViveSR::anipal::Eye::EyeData_v2 eye_data_v2;
 
         // Right before we start our loop, we finally subscribe to the SIGINT interrupt. This is so we can cleanly shut down if the user hits ctrl+c.
         typedef void (*SignalHandlerPointer)(int);
@@ -170,7 +191,18 @@ int main(int argc, char** argv) {
 
         std::cout << "Running! Hit Ctrl+C to exit.\n" << std::flush;
         while (running) {
-            main_loop(lip_data_v2, lua_state, ConnectSocket);
+            // We know the update function exists at this point because it was checked earlier.
+            lua_getglobal(lua_state, "update");
+            // Finally call the function, checking for errors!
+            lua_pushlips(lua_state, lip_data_v2);
+            lua_pusheyes(lua_state, eye_data_v2);
+            if (lua_pcall(lua_state, 2, 0, 0) != LUA_OK) {
+                throw std::exception(lua_tostring(lua_state,-1));
+            }
+            // Lua should've pushed a bunch of stuff into our dictionary. Here we wrap it all up and send it to VRChat.
+            SendData(VRCData, ConnectSocket);
+            // We sleep for 10 milliseconds so that we can relinquish control back to the OS. Without this we'll eat an entire core!
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         // Reset the signal handlers
         signal(SIGINT, previousHandler);
@@ -195,33 +227,202 @@ int main(int argc, char** argv) {
     return exitCode;
 }
 
-// main_loop is ran very often within a while loop. This is where all our apis are set up, error checked, and available for use.
-void main_loop(ViveSR::anipal::Lip::LipData_v2& lip_data_v2, lua_State* lua_state, SOCKET ConnectSocket) {
-    int result = ViveSR::anipal::Lip::GetLipData_v2(&lip_data_v2);
-    if (result == ViveSR::Error::WORK) {
-        float* weightings = lip_data_v2.prediction_data.blend_shape_weight;
-        // We know the update function exists at this point because it was checked earlier.
-        lua_getglobal(lua_state, "update");
-        // Construct a new table
+void lua_pushcombined(lua_State* lua_state, ViveSR::anipal::Eye::CombinedEyeData& combinedEye) {
+    lua_newtable(lua_state);
+        lua_pushstring(lua_state, "convergenceDistance");
+        lua_pushnumber(lua_state, combinedEye.convergence_distance_mm);
+        lua_settable(lua_state, -3);
+
+        lua_pushstring(lua_state, "convergenceDistanceValid");
+        lua_pushboolean(lua_state, combinedEye.convergence_distance_validity);
+        lua_settable(lua_state, -3);
+
+        lua_pushstring(lua_state, "openness");
+        lua_pushnumber(lua_state, combinedEye.eye_data.eye_openness);
+        lua_settable(lua_state, -3);
+
+        lua_pushstring(lua_state, "gazeDirectionNormalized");
         lua_newtable(lua_state);
-        // Loop through all the Version2 enums to store the new data into the table.
-        for (int i = ViveSR::anipal::Lip::Version2::Jaw_Right; i < ViveSR::anipal::Lip::Version2::Max; i++) {
-            lua_pushstring(lua_state, ConvertLipCode((ViveSR::anipal::Lip::Version2::LipShape_v2)i).c_str());
-            lua_pushnumber(lua_state, weightings[i]);
+            lua_pushstring(lua_state, "x");
+            lua_pushnumber(lua_state, combinedEye.eye_data.gaze_direction_normalized.x);
             lua_settable(lua_state, -3);
-        }
-        // Finally call the function, checking for errors!
-        if (lua_pcall(lua_state, 1, 0, 0) != LUA_OK) {
-            throw std::exception(lua_tostring(lua_state,-1));
-        }
-        // We sleep for 10 milliseconds so that we can relinquish control back to the OS. Without this we'll eat an entire core!
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    } else {
-        // If the lipsync failed, we wait for a bit longer (steamvr could be starting, headset could be off, etc).
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            lua_pushstring(lua_state, "y");
+            lua_pushnumber(lua_state, combinedEye.eye_data.gaze_direction_normalized.y);
+            lua_settable(lua_state, -3);
+            lua_pushstring(lua_state, "z");
+            lua_pushnumber(lua_state, combinedEye.eye_data.gaze_direction_normalized.z);
+            lua_settable(lua_state, -3);
+        lua_settable(lua_state, -3);
+
+        lua_pushstring(lua_state, "gazeOrigin");
+        lua_newtable(lua_state);
+            lua_pushstring(lua_state, "x");
+            lua_pushnumber(lua_state, combinedEye.eye_data.gaze_origin_mm.x);
+            lua_settable(lua_state, -3);
+            lua_pushstring(lua_state, "y");
+            lua_pushnumber(lua_state, combinedEye.eye_data.gaze_origin_mm.y);
+            lua_settable(lua_state, -3);
+            lua_pushstring(lua_state, "z");
+            lua_pushnumber(lua_state, combinedEye.eye_data.gaze_origin_mm.z);
+            lua_settable(lua_state, -3);
+        lua_settable(lua_state, -3);
+
+        lua_pushstring(lua_state, "pupilDiameter");
+        lua_pushnumber(lua_state, combinedEye.eye_data.pupil_diameter_mm);
+        lua_settable(lua_state, -3);
+
+        lua_pushstring(lua_state, "pupilPosition");
+        lua_newtable(lua_state);
+            lua_pushstring(lua_state, "x");
+            lua_pushnumber(lua_state, combinedEye.eye_data.pupil_position_in_sensor_area.x);
+            lua_settable(lua_state, -3);
+            lua_pushstring(lua_state, "y");
+            lua_pushnumber(lua_state, combinedEye.eye_data.pupil_position_in_sensor_area.y);
+            lua_settable(lua_state, -3);
+        lua_settable(lua_state, -3);
+
+        uint64_t validBitMask = combinedEye.eye_data.eye_data_validata_bit_mask;
+        lua_pushstring(lua_state, "gazeOriginValid");
+        lua_pushboolean(lua_state, ViveSR::anipal::Eye::DecodeBitMask(validBitMask, ViveSR::anipal::Eye::SingleEyeDataValidity::SINGLE_EYE_DATA_GAZE_ORIGIN_VALIDITY));
+        lua_settable(lua_state, -3);
+        lua_pushstring(lua_state, "gazeValid");
+        lua_pushboolean(lua_state, ViveSR::anipal::Eye::DecodeBitMask(validBitMask, ViveSR::anipal::Eye::SingleEyeDataValidity::SINGLE_EYE_DATA_GAZE_DIRECTION_VALIDITY));
+        lua_settable(lua_state, -3);
+        lua_pushstring(lua_state, "pupilDiameterValid");
+        lua_pushboolean(lua_state, ViveSR::anipal::Eye::DecodeBitMask(validBitMask, ViveSR::anipal::Eye::SingleEyeDataValidity::SINGLE_EYE_DATA_PUPIL_DIAMETER_VALIDITY));
+        lua_settable(lua_state, -3);
+        lua_pushstring(lua_state, "opennessValid");
+        lua_pushboolean(lua_state, ViveSR::anipal::Eye::DecodeBitMask(validBitMask, ViveSR::anipal::Eye::SingleEyeDataValidity::SINGLE_EYE_DATA_EYE_OPENNESS_VALIDITY));
+        lua_settable(lua_state, -3);
+        lua_pushstring(lua_state, "pupilPositionInSensorAreaValid");
+        lua_pushboolean(lua_state, ViveSR::anipal::Eye::DecodeBitMask(validBitMask, ViveSR::anipal::Eye::SingleEyeDataValidity::SINGLE_EYE_DATA_PUPIL_POSITION_IN_SENSOR_AREA_VALIDITY));
+        lua_settable(lua_state, -3);
+}
+
+void lua_pusheye(lua_State* lua_state, ViveSR::anipal::Eye::SingleEyeData& targetEye, ViveSR::anipal::Eye::SingleEyeExpression& targetExpression) {
+    lua_newtable(lua_state);
+        // Gaze direction
+        lua_pushstring(lua_state, "gazeDirectionNormalized");
+        lua_newtable(lua_state);
+            lua_pushstring(lua_state, "x");
+            lua_pushnumber(lua_state, targetEye.gaze_direction_normalized.x);
+            lua_settable(lua_state, -3);
+            lua_pushstring(lua_state, "y");
+            lua_pushnumber(lua_state, targetEye.gaze_direction_normalized.y);
+            lua_settable(lua_state, -3);
+            lua_pushstring(lua_state, "z");
+            lua_pushnumber(lua_state, targetEye.gaze_direction_normalized.z);
+            lua_settable(lua_state, -3);
+        lua_settable(lua_state, -3);
+
+        lua_pushstring(lua_state, "openness");
+        lua_pushnumber(lua_state, targetEye.eye_openness);
+        lua_settable(lua_state, -3);
+
+        // Gaze origin
+        lua_pushstring(lua_state, "gazeOrigin");
+        lua_newtable(lua_state);
+            lua_pushstring(lua_state, "x");
+            lua_pushnumber(lua_state, targetEye.gaze_origin_mm.x);
+            lua_settable(lua_state, -3);
+            lua_pushstring(lua_state, "y");
+            lua_pushnumber(lua_state, targetEye.gaze_origin_mm.y);
+            lua_settable(lua_state, -3);
+            lua_pushstring(lua_state, "z");
+            lua_pushnumber(lua_state, targetEye.gaze_origin_mm.z);
+            lua_settable(lua_state, -3);
+        lua_settable(lua_state, -3);
+
+        lua_pushstring(lua_state, "pupilDiameter");
+        lua_pushnumber(lua_state, targetEye.pupil_diameter_mm);
+        lua_settable(lua_state, -3);
+
+        lua_pushstring(lua_state, "pupilPosition");
+        lua_newtable(lua_state);
+            lua_pushstring(lua_state, "x");
+            lua_pushnumber(lua_state, targetEye.pupil_position_in_sensor_area.x);
+            lua_settable(lua_state, -3);
+            lua_pushstring(lua_state, "y");
+            lua_pushnumber(lua_state, targetEye.pupil_position_in_sensor_area.y);
+            lua_settable(lua_state, -3);
+        lua_settable(lua_state, -3);
+
+        // Valid masks
+        uint64_t validBitMask = targetEye.eye_data_validata_bit_mask;
+        lua_pushstring(lua_state, "gazeOriginValid");
+        lua_pushboolean(lua_state, ViveSR::anipal::Eye::DecodeBitMask(validBitMask, ViveSR::anipal::Eye::SingleEyeDataValidity::SINGLE_EYE_DATA_GAZE_ORIGIN_VALIDITY));
+        lua_settable(lua_state, -3);
+        lua_pushstring(lua_state, "gazeValid");
+        lua_pushboolean(lua_state, ViveSR::anipal::Eye::DecodeBitMask(validBitMask, ViveSR::anipal::Eye::SingleEyeDataValidity::SINGLE_EYE_DATA_GAZE_DIRECTION_VALIDITY));
+        lua_settable(lua_state, -3);
+        lua_pushstring(lua_state, "pupilDiameterValid");
+        lua_pushboolean(lua_state, ViveSR::anipal::Eye::DecodeBitMask(validBitMask, ViveSR::anipal::Eye::SingleEyeDataValidity::SINGLE_EYE_DATA_PUPIL_DIAMETER_VALIDITY));
+        lua_settable(lua_state, -3);
+        lua_pushstring(lua_state, "opennessValid");
+        lua_pushboolean(lua_state, ViveSR::anipal::Eye::DecodeBitMask(validBitMask, ViveSR::anipal::Eye::SingleEyeDataValidity::SINGLE_EYE_DATA_EYE_OPENNESS_VALIDITY));
+        lua_settable(lua_state, -3);
+        lua_pushstring(lua_state, "pupilPositionInSensorAreaValid");
+        lua_pushboolean(lua_state, ViveSR::anipal::Eye::DecodeBitMask(validBitMask, ViveSR::anipal::Eye::SingleEyeDataValidity::SINGLE_EYE_DATA_PUPIL_POSITION_IN_SENSOR_AREA_VALIDITY));
+        lua_settable(lua_state, -3);
+
+        lua_pushstring(lua_state, "expression");
+        lua_newtable(lua_state);
+            lua_pushstring(lua_state, "frown");
+            lua_pushnumber(lua_state, targetExpression.eye_frown);
+            lua_settable(lua_state, -3);
+
+            lua_pushstring(lua_state, "squeeze");
+            lua_pushnumber(lua_state, targetExpression.eye_squeeze);
+            lua_settable(lua_state, -3);
+
+            lua_pushstring(lua_state, "wide");
+            lua_pushnumber(lua_state, targetExpression.eye_wide);
+            lua_settable(lua_state, -3);
+        lua_settable(lua_state, -3);
+}
+
+void lua_pusheyes(lua_State* lua_state, ViveSR::anipal::Eye::EyeData_v2& eye_data_v2) {
+    if (!workingEyes) {
+        lua_pushnil(lua_state);
+        return;
     }
-    // Lua should've pushed a bunch of stuff into our dictionary. Here we wrap it all up and send it to VRChat.
-    SendData(VRCData, ConnectSocket);
+    int result = ViveSR::anipal::Eye::GetEyeData_v2(&eye_data_v2);
+    if (result != ViveSR::Error::WORK) {
+        lua_pushnil(lua_state);
+        return;
+    }
+    // Construct a new table
+    lua_newtable(lua_state);
+        lua_pushstring(lua_state, "left");
+        lua_pusheye(lua_state, eye_data_v2.verbose_data.left, eye_data_v2.expression_data.left);
+        lua_settable(lua_state, -3);
+        lua_pushstring(lua_state, "right");
+        lua_pusheye(lua_state, eye_data_v2.verbose_data.right, eye_data_v2.expression_data.right);
+        lua_settable(lua_state, -3);
+        lua_pushstring(lua_state, "combined");
+        lua_pushcombined(lua_state, eye_data_v2.verbose_data.combined);
+        lua_settable(lua_state, -3);
+}
+
+void lua_pushlips(lua_State* lua_state, ViveSR::anipal::Lip::LipData_v2& lip_data_v2) {
+    if (!workingLips) {
+        lua_pushnil(lua_state);
+        return;
+    }
+    int result = ViveSR::anipal::Lip::GetLipData_v2(&lip_data_v2);
+    if (result != ViveSR::Error::WORK) {
+        lua_pushnil(lua_state);
+        return;
+    }
+    float* weightings = lip_data_v2.prediction_data.blend_shape_weight;
+    // Construct a new table
+    lua_newtable(lua_state);
+    // Loop through all the Version2 enums to store the new data into the table.
+    for (int i = ViveSR::anipal::Lip::Version2::Jaw_Right; i < ViveSR::anipal::Lip::Version2::Max; i++) {
+        lua_pushstring(lua_state, ConvertLipCode((ViveSR::anipal::Lip::Version2::LipShape_v2)i).c_str());
+        lua_pushnumber(lua_state, weightings[i]);
+        lua_settable(lua_state, -3);
+    }
 }
 
 // In C++, enums are truely just raw bytes. Gotta convert them somehow! :clown:
