@@ -6,6 +6,7 @@ function sign(x)
 end
 
 function update(lipdata)
+    -- This compression strategy was developed by [Vilar](https://github.com/Vilar24)! Thank you so much!
     tongueOutStart = lipdata["Tongue_LongStep1"]
     tongueOut = tongueOutStart + lipdata["Tongue_LongStep2"]
     jawOpen = lipdata["Jaw_Open"] - lipdata["Mouth_Ape_Shape"]
