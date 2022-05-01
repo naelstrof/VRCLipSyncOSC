@@ -160,6 +160,7 @@ int main(int argc, char** argv) {
         error = ViveSR::anipal::Initial(ViveSR::anipal::Eye::ANIPAL_TYPE_EYE_V2, NULL);
         if (error == ViveSR::Error::WORK) {
             std::cout << "Successfully initialize version2 Eye engine.\n" << std::flush;
+            //ViveSR::anipal::Eye::RegisterEyeDataCallback_v2(EyeCallback_v2);
             workingEyes = true;
         } else {
             std::cerr << "[Non-fatal] Failed to initialize version2 Eye engine. Please refer to the code " << error << " " << CovertErrorCode(error) << "\n" << std::flush;
@@ -169,14 +170,11 @@ int main(int argc, char** argv) {
         if (!workingLips && !workingEyes) {
             throw std::exception("Aborting due to having no data to send!");
         }
-
         
         ViveSR::anipal::Lip::LipData_v2 lip_data_v2;
-        // we use some data on the heap (lip_image) to store the depth data. This is much faster than using the stack.
-        lip_data_v2.image = lip_image;
-
-        // eye data apparently has a different api, and does not need any data.
         ViveSR::anipal::Eye::EyeData_v2 eye_data_v2;
+        // we use some data on the heap (lip_image) to store the depth data. This is much better than using the stack.
+        lip_data_v2.image = lip_image;
 
         // Right before we start our loop, we finally subscribe to the SIGINT interrupt. This is so we can cleanly shut down if the user hits ctrl+c.
         typedef void (*SignalHandlerPointer)(int);
@@ -213,7 +211,13 @@ int main(int argc, char** argv) {
         exitCode = EXIT_FAILURE;
     }
     // Release the lip sync tracking.
-    ViveSR::anipal::Release(ViveSR::anipal::Lip::ANIPAL_TYPE_LIP_V2);
+    if (workingLips) {
+        ViveSR::anipal::Release(ViveSR::anipal::Lip::ANIPAL_TYPE_LIP_V2);
+    }
+    if (workingEyes) {
+        //ViveSR::anipal::Eye::UnregisterEyeDataCallback_v2(EyeCallback_v2);
+        ViveSR::anipal::Release(ViveSR::anipal::Eye::ANIPAL_TYPE_EYE_V2);
+    }
     // Close the Lua state
     lua_close(lua_state);
     // Close our connection
@@ -386,11 +390,13 @@ void lua_pusheyes(lua_State* lua_state, ViveSR::anipal::Eye::EyeData_v2& eye_dat
         lua_pushnil(lua_state);
         return;
     }
+
     int result = ViveSR::anipal::Eye::GetEyeData_v2(&eye_data_v2);
     if (result != ViveSR::Error::WORK) {
         lua_pushnil(lua_state);
         return;
     }
+
     // Construct a new table
     lua_newtable(lua_state);
         lua_pushstring(lua_state, "left");
