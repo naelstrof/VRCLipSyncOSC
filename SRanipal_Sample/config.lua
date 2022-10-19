@@ -40,8 +40,20 @@ function update(lipdata, eyedata)
         --              wide (number)
 
         -- I don't have an eye tracker, so this is just an example!
-        SendData("/avatar/parameters/EyeX", eyedata.combined.pupilPosition.x)
-        SendData("/avatar/parameters/EyeY", eyedata.combined.pupilPosition.y)
+        if (eyedata.combined.gazeValid) then
+            SendData("/avatar/parameters/EyeX", (-eyedata.combined.gazeDirectionNormalized.x+1)/2)
+            SendData("/avatar/parameters/EyeY", (eyedata.combined.gazeDirectionNormalized.y+1)/2)
+        end
+        if (eyedata.left.opennessValid) then
+            SendData("/avatar/parameters/EyeOpenLeft", eyedata.left.openness)
+        end
+        if (eyedata.right.opennessValid) then
+            SendData("/avatar/parameters/EyeOpenRight", eyedata.right.openness)
+        end
+        eyeBrowLeft = (eyedata.left.expression.wide - eyedata.left.expression.frown + 1)/2
+        eyeBrowRight = (eyedata.right.expression.wide - eyedata.right.expression.frown + 1)/2
+        SendData("/avatar/parameters/EyebrowLeft", eyeBrowLeft)
+        SendData("/avatar/parameters/EyebrowRight", eyeBrowRight)
     end
     if lipdata ~= nil then -- If we have lips data
         -- Available data:

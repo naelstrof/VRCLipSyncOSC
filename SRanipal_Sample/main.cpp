@@ -32,6 +32,7 @@ void lua_pusheyes(lua_State* lua_state, ViveSR::anipal::Eye::EyeData_v2& eye_dat
 // Stuff I'd rather keep on the heap instead of the stack.
 char networkBuffer[1024];
 char lip_image[800 * 400];
+static ViveSR::anipal::Eye::EyeData_v2 cachedEyeData;
 // Things shared between functions.
 std::map<const char*, float> VRCData;
 volatile bool running = true;
@@ -84,6 +85,17 @@ BOOL WINAPI consoleHandler(_In_ DWORD signal) {
     std::cerr << "Caught signal " << signal << ", cleanly shutting down...\n" << std::flush;
     running = false;
     return TRUE;
+}
+
+// Eyecallback
+void eyeDataReceivedCallback(ViveSR::anipal::Eye::EyeData_v2 const& eye_data) {
+    //memcpy(&cachedEyeData, eye_data, sizeof(ViveSR::anipal::Eye::EyeData));
+    cachedEyeData = eye_data;
+    bool needCalibration = false;
+    int error = ViveSR::anipal::Eye::IsUserNeedCalibration(&needCalibration);
+    //if (needCalibration) {
+        //std::cerr << "SRanipal reports that you need to do eye calibration.\n" << std::flush;
+    //}
 }
 
 // Main's responsibility right now is to initialize/uninitialize our three apis: An outgoing UDP packet socket, a lua state, and the lipsync api.
@@ -160,7 +172,7 @@ int main(int argc, char** argv) {
         error = ViveSR::anipal::Initial(ViveSR::anipal::Eye::ANIPAL_TYPE_EYE_V2, NULL);
         if (error == ViveSR::Error::WORK) {
             std::cout << "Successfully initialize version2 Eye engine.\n" << std::flush;
-            //ViveSR::anipal::Eye::RegisterEyeDataCallback_v2(EyeCallback_v2);
+            ViveSR::anipal::Eye::RegisterEyeDataCallback_v2(eyeDataReceivedCallback);
             workingEyes = true;
         } else {
             std::cerr << "[Non-fatal] Failed to initialize version2 Eye engine. Please refer to the code " << error << " " << CovertErrorCode(error) << "\n" << std::flush;
@@ -172,7 +184,6 @@ int main(int argc, char** argv) {
         }
         
         ViveSR::anipal::Lip::LipData_v2 lip_data_v2;
-        ViveSR::anipal::Eye::EyeData_v2 eye_data_v2;
         // we use some data on the heap (lip_image) to store the depth data. This is much better than using the stack.
         lip_data_v2.image = lip_image;
 
@@ -193,14 +204,14 @@ int main(int argc, char** argv) {
             lua_getglobal(lua_state, "update");
             // Finally call the function, checking for errors!
             lua_pushlips(lua_state, lip_data_v2);
-            lua_pusheyes(lua_state, eye_data_v2);
+            lua_pusheyes(lua_state, cachedEyeData);
             if (lua_pcall(lua_state, 2, 0, 0) != LUA_OK) {
                 throw std::exception(lua_tostring(lua_state,-1));
             }
             // Lua should've pushed a bunch of stuff into our dictionary. Here we wrap it all up and send it to VRChat.
             SendData(VRCData, ConnectSocket);
-            // We sleep for 10 milliseconds so that we can relinquish control back to the OS. Without this we'll eat an entire core!
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            // We sleep for 13 milliseconds so that we can relinquish control back to the OS. Without this we'll eat an entire core!
+            std::this_thread::sleep_for(std::chrono::milliseconds(13));
         }
         // Reset the signal handlers
         signal(SIGINT, previousHandler);
@@ -216,6 +227,7 @@ int main(int argc, char** argv) {
     }
     if (workingEyes) {
         //ViveSR::anipal::Eye::UnregisterEyeDataCallback_v2(EyeCallback_v2);
+        ViveSR::anipal::Eye::UnregisterEyeDataCallback_v2(eyeDataReceivedCallback);
         ViveSR::anipal::Release(ViveSR::anipal::Eye::ANIPAL_TYPE_EYE_V2);
     }
     // Close the Lua state
@@ -391,11 +403,11 @@ void lua_pusheyes(lua_State* lua_state, ViveSR::anipal::Eye::EyeData_v2& eye_dat
         return;
     }
 
-    int result = ViveSR::anipal::Eye::GetEyeData_v2(&eye_data_v2);
-    if (result != ViveSR::Error::WORK) {
-        lua_pushnil(lua_state);
-        return;
-    }
+    //int result = ViveSR::anipal::Eye::GetEyeData_v2(&eye_data_v2);
+    //if (result != ViveSR::Error::WORK) {
+        //lua_pushnil(lua_state);
+        //return;
+    //}
 
     // Construct a new table
     lua_newtable(lua_state);
